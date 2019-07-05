@@ -2,6 +2,7 @@
 package dcoslogin
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/tls"
 	"encoding/base64"
@@ -13,6 +14,7 @@ import (
 	"net/http/cookiejar"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 
@@ -20,7 +22,10 @@ import (
 )
 
 // Debug can be set to true for (very) verbose output, helpful for troubleshooting OAuth issues
-var Debug = false
+var Debug = true
+
+var Jar *cookiejar.Jar
+var DeviceID string
 
 // Options has the parameters needed to login to DC/OS
 type Options struct {
@@ -74,6 +79,7 @@ type client struct {
 
 func httpClient(allowInsecureTLS bool) (*client, error) {
 	jar, err := cookiejar.New(nil)
+	Jar = jar
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +91,21 @@ func httpClient(allowInsecureTLS bool) (*client, error) {
 			},
 			Jar: jar,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				debug(req.Method, req.URL)
+				//debug(req.Method, req.URL)
+				fmt.Printf("redirect to ---> %v\n\n", req.URL)
+				if strings.Contains(req.URL.String(), "https://github.com/login/oauth/authorize?client_id") {
+					fmt.Println("stopping redirection")
+					//return errors.New("net/http: use last response")
+				}
+				for _, r := range via {
+					for _, c := range r.Cookies() {
+						fmt.Printf("---> %v - %v : %v\n", r.URL.String(), c.Name, c.Value)
+					}
+				}
+
+				for _, c := range req.Cookies() {
+					fmt.Printf("---> %v - %v : %v\n", req.URL.String(), c.Name, c.Value)
+				}
 				return nil
 			},
 		},
@@ -111,15 +131,26 @@ func (c *client) Get(endpoint string, query url.Values) (*http.Response, error) 
 }
 
 func (c *client) PostForm(endpoint string, data url.Values) (*http.Response, error) {
-	res, err := c.Client.Post(endpoint, "application/x-www-form-urlencoded", strings.NewReader(data.Encode()))
-	if err != nil {
-		return nil, err
-	}
+	req, _ := http.NewRequest("POST", endpoint, strings.NewReader(data.Encode()))
+	/*
+		if ghSession != "" {
+			fmt.Printf("--- have a session, using %v %v\n\n", endpoint, ghSession)
+			req.AddCookie(&http.Cookie{Name: "_gh_sess", Value: ghSession, Path: "/"})
+		}
+	*/
+	//
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	res, _ := c.Client.Do(req)
+	fmt.Printf("Got %v for %v\n\n", res.StatusCode, endpoint)
+	/*
+		if err != nil {
+			return nil, err
+		}
 
-	if err := checkStatus(res); err != nil {
-		return nil, err
-	}
-
+		if err := checkStatus(res); err != nil {
+			return nil, err
+		}
+	*/
 	return res, nil
 }
 
@@ -173,26 +204,77 @@ func (c *client) initiateAuth0(clusterID, clientID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-
+	/*
+		for _, cookie := range res.Cookies() {
+			fmt.Printf("- auth0 cookie: %v : %v\n\n", cookie.Name, cookie.Value)
+			if cookie.Name == "_gh_sess" {
+				u, _ := url.Parse("https://github.com/session")
+				var cookies []*http.Cookie
+				cookies = append(cookies, cookie)
+				Jar.SetCookies(u, cookies)
+			}
+		}
+	*/
 	csrf, found := doc.Find(`input[name="authenticity_token"]`).Attr("value")
 	if !found {
 		return "", errors.New("Unable to extract CSRF token from response")
 	}
-
+	fmt.Printf("CSRF: %v\n", csrf)
 	return csrf, nil
 }
 
 func (c *client) githubAuthenticate(csrfToken, username, password string) (string, error) {
-	ghRes, err := c.PostForm("https://github.com/session", url.Values{
+	/*
+		loginRes, err := c.Get("https://github.com/login", url.Values{})
+		if err != nil {
+			return "", err
+		}
+
+		for _, cookie := range loginRes.Cookies() {
+			fmt.Printf("- cookie: %v : %v\n\n", cookie.Name, cookie.Value)
+			if cookie.Name == "_gh_sess" {
+				ghSession = cookie.Value
+			}
+		}
+
+		doc, err := goquery.NewDocumentFromResponse(loginRes)
+		if err != nil {
+			return "", err
+		}
+
+		csrf, found := doc.Find(`input[name="authenticity_token"]`).Attr("value")
+		if !found {
+			return "", errors.New("Unable to extract CSRF token from response")
+		}
+
+		fmt.Println(csrf)
+		fmt.Println(url.QueryEscape(csrf))
+	*/
+	sessionRes, err := c.PostForm("https://github.com/session", url.Values{
 		"login":              []string{username},
 		"password":           []string{password},
 		"authenticity_token": []string{csrfToken},
 	})
-	if err != nil {
-		return "", err
+
+	/*
+		body, err := ioutil.ReadAll(sessionRes.Body)
+		bodyString := string(body)
+		fmt.Printf("doc: %v\n\n", bodyString)
+
+	*/
+
+	for _, cookie := range sessionRes.Cookies() {
+		fmt.Printf("- cookie: %v : %v\n\n", cookie.Name, cookie.Value)
 	}
 
-	tokenRes, err := c.followLoginRedirect(ghRes)
+	u, _ := url.Parse("https://github.com/login/oauth/authorize")
+	for _, cookie := range Jar.Cookies(u) {
+		if cookie.Name == "_device_id" {
+			DeviceID = cookie.Value
+		}
+	}
+
+	tokenRes, err := c.followLoginRedirect(sessionRes)
 	if err != nil {
 		return "", err
 	}
@@ -220,11 +302,23 @@ func (c *client) finishLogin(clusterURL, auth0Token string) (string, error) {
 }
 
 func (c *client) followLoginRedirect(res *http.Response) (*http.Response, error) {
+	/*
+		body, err := ioutil.ReadAll(res.Body)
+		bodyString := string(body)
+		fmt.Printf("doc: %v\n\n", bodyString)
+	*/
 	dump, err := httputil.DumpResponse(res, true)
 	if err != nil {
 		return nil, err
 	}
-
+	/*
+		for _, cookie := range res.Cookies() {
+			fmt.Printf("- cookie: %v : %v\n\n", cookie.Name, cookie.Value)
+			if cookie.Name == "_gh_sess" {
+				ghSession = cookie.Value
+			}
+		}
+	*/
 	doc, err := goquery.NewDocumentFromResponse(res)
 	if err != nil {
 		return nil, err
@@ -234,6 +328,43 @@ func (c *client) followLoginRedirect(res *http.Response) (*http.Response, error)
 	// Easy path, no re-authorization
 	if found {
 		return c.Get(redirectURL, nil)
+	}
+
+	var verificationForm *goquery.Selection
+	doc.Find("form").Each(func(i int, s *goquery.Selection) {
+		action, _ := s.Attr("action")
+		if action == "/sessions/verified-device" {
+			verificationForm = s
+		}
+	})
+
+	if verificationForm != nil {
+		fmt.Print("Device verification required, this is normally required only one time per device so subsequent \ncalls should be non-interactive on this device. Enter the code you received by e-mail:\n")
+
+		reader := bufio.NewReader(os.Stdin)
+		verificationCode, _ := reader.ReadString('\n')
+		verificationCode = strings.TrimSuffix(verificationCode, "\n")
+		q := url.Values{}
+		verificationForm.Find("input").Each(func(_ int, input *goquery.Selection) {
+			name, _ := input.Attr("name")
+			value, _ := input.Attr("value")
+			q.Add(name, value)
+		})
+		q.Del("otp")
+		q.Add("otp", verificationCode)
+
+		response, err := c.PostForm("https://github.com/sessions/verified-device", q)
+		if response.StatusCode != 200 || err != nil {
+			return nil, errors.New("Unexpected Github response during device verification")
+		}
+		fmt.Printf("verified device cookies: %v\n\n", response.Cookies())
+		doc, err = goquery.NewDocumentFromResponse(response)
+
+		redirectURL, found := doc.Find(".container div p a").Attr("href")
+		// Easy path, no re-authorization
+		if found {
+			return c.Get(redirectURL, nil)
+		}
 	}
 
 	// Check if Github is simply asking for re-authorization
